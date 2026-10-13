@@ -1,9 +1,14 @@
 /**
  * Core ConflictHealer Engine
- * Orchestrates file scanning, conflict extraction, AST healing, and post-resolution verification
+ * Orchestrates:
+ * 1. Conflict detection & validation of Git conflict markers
+ * 2. Reconstructing complete document branches (Ours vs Theirs)
+ * 3. Semantic AST reconciliation via specialized Salesforce resolvers
+ * 4. Post-resolution XML well-formedness & Git marker absence verification
+ * 5. Atomic file replacement with backup preservation (.bak)
  */
 
-import { readFile, writeFile } from 'fs/promises';
+import { readFile, writeFile, copyFile, unlink } from 'fs/promises';
 import { glob } from 'glob';
 import path from 'path';
 import { parseConflictMarkers } from './conflict-parser.js';
@@ -16,71 +21,154 @@ export async function healConflicts(targetPath = '.', options = {}) {
 
   const files = await glob('**/*', {
     cwd: absPath,
-    ignore: ['**/node_modules/**', '**/.git/**', '**/.sfdx/**', '**/.sf/**'],
+    ignore: ['**/node_modules/**', '**/.git/**', '**/.sfdx/**', '**/.sf/**', '**/*.bak'],
     nodir: true,
     absolute: true,
   });
 
+  const filesScannedCount = files.length;
+  let conflictsDetectedCount = 0;
   const healedFiles = [];
+  const manualReviewFiles = [];
   const errors = [];
-  let totalConflictsResolved = 0;
+  const backupsCreated = [];
 
   for (const file of files) {
+    const relFile = path.relative(absPath, file);
     try {
       const content = await readFile(file, 'utf8');
-      const { hasConflicts, conflicts } = parseConflictMarkers(content);
+      const parseResult = parseConflictMarkers(content);
 
-      if (!hasConflicts) continue;
-
-      let healedContent = content;
-      const isXml = file.endsWith('.xml') || file.endsWith('-meta.xml') || file.endsWith('.profile') || file.endsWith('.permissionset') || file.endsWith('.object');
-
-      for (const conflict of conflicts) {
-        let resolvedChunk = '';
-
-        if (isXml) {
-          resolvedChunk = xmlResolver.resolveConflictChunk(conflict.ours, conflict.theirs, file);
-        } else {
-          // Standard smart union
-          resolvedChunk = xmlResolver.additiveUnion(conflict.ours, conflict.theirs);
-        }
-
-        healedContent = healedContent.replace(conflict.fullMatch, resolvedChunk);
-        totalConflictsResolved++;
+      if (parseResult.hasMalformedMarkers) {
+        errors.push({
+          file: relFile,
+          error: `Malformed conflict markers detected: ${parseResult.errors.map(e => e.message).join('; ')}`,
+        });
+        continue;
       }
 
-      // Verify healed XML validity
-      if (isXml) {
-        const validation = XMLValidator.validate(healedContent);
-        if (validation !== true) {
-          errors.push({
-            file: path.relative(absPath, file),
-            error: `XML syntax validation failed post-heal: ${validation.err?.msg || 'Malformed XML'}`,
+      if (!parseResult.hasConflicts) continue;
+
+      conflictsDetectedCount += parseResult.count;
+      const isXml = isXmlMetadata(file);
+
+      if (!isXml) {
+        // Non-XML files require review unless supported
+        manualReviewFiles.push({
+          file: relFile,
+          reason: 'Non-XML metadata conflict: automated semantic AST healing is only safe for XML metadata.',
+          conflictsCount: parseResult.count,
+        });
+        continue;
+      }
+
+      // Reconstruct the two complete document branches
+      const docOurs = reconstructBranch(content, parseResult.conflicts, 'ours');
+      const docTheirs = reconstructBranch(content, parseResult.conflicts, 'theirs');
+
+      // Attempt structural merge
+      const mergeResult = xmlResolver.resolveDocument(docOurs, docTheirs, file);
+
+      if (!mergeResult.success) {
+        if (mergeResult.requiresReview) {
+          manualReviewFiles.push({
+            file: relFile,
+            reason: mergeResult.reason,
+            conflictsCount: parseResult.count,
           });
-          continue;
+        } else {
+          errors.push({
+            file: relFile,
+            error: mergeResult.reason,
+          });
         }
+        // CRITICAL SAFETY: original file remains 100% untouched
+        continue;
       }
 
-      if (options.dryRun !== true) {
-        await writeFile(file, healedContent, 'utf8');
+      const mergedXml = mergeResult.mergedXml;
+
+      // POST-MERGE INTEGRITY CHECKS:
+      // Check 1: Absence of any Git conflict markers
+      if (hasAnyConflictMarker(mergedXml)) {
+        errors.push({
+          file: relFile,
+          error: 'Integrity check failed: merged output still contains conflict markers.',
+        });
+        continue;
+      }
+
+      // Check 2: Independent XML parser validation
+      const xmlValidation = XMLValidator.validate(mergedXml);
+      if (xmlValidation !== true) {
+        errors.push({
+          file: relFile,
+          error: `Post-heal XML well-formedness failed: ${xmlValidation.err?.msg || 'syntax error'}`,
+        });
+        continue;
+      }
+
+      // Writing safely with backup
+      const backupPath = `${file}.bak`;
+      if (!options.dryRun) {
+        if (options.backup !== false) {
+          await copyFile(file, backupPath);
+          backupsCreated.push(path.relative(absPath, backupPath));
+        }
+        await writeFile(file, mergedXml, 'utf8');
       }
 
       healedFiles.push({
-        file: path.relative(absPath, file),
-        conflictsCount: conflicts.length,
-        isXml,
+        file: relFile,
+        conflictsCount: parseResult.count,
+        isXml: true,
+        stats: mergeResult.stats || {},
+        backupPath: options.dryRun ? null : (options.backup !== false ? path.relative(absPath, backupPath) : null),
       });
+
     } catch (err) {
       errors.push({
-        file: path.relative(absPath, file),
+        file: relFile,
         error: err.message,
       });
     }
   }
 
   return {
+    filesScanned: filesScannedCount,
+    conflictsDetected: conflictsDetectedCount,
     healedFiles,
-    totalConflictsResolved,
+    manualReviewFiles,
     errors,
+    backupsCreated,
+    dryRun: Boolean(options.dryRun),
   };
+}
+
+function isXmlMetadata(filePath) {
+  const f = filePath.toLowerCase();
+  return (
+    f.endsWith('.xml') ||
+    f.endsWith('-meta.xml') ||
+    f.endsWith('.profile') ||
+    f.endsWith('.permissionset') ||
+    f.endsWith('.object') ||
+    f.endsWith('.labels')
+  );
+}
+
+function reconstructBranch(content, conflicts, branchSide) {
+  let result = content;
+  // Replace backwards by start index so indices don't shift
+  const sorted = [...conflicts].sort((a, b) => b.startLine - a.startLine);
+
+  for (const c of sorted) {
+    const replacement = branchSide === 'ours' ? c.ours : c.theirs;
+    result = result.replace(c.rawBlock, replacement);
+  }
+  return result;
+}
+
+function hasAnyConflictMarker(text) {
+  return /<<<<<<<|=======|>>>>>>>/m.test(text);
 }

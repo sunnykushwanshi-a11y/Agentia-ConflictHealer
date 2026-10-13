@@ -11,7 +11,8 @@
     "start": "node src/cli.js",
     "mcp": "node src/mcp-server.js",
     "resolve": "node src/cli.js resolve",
-    "demo": "node src/demo.js",
+    "test": "node tests/test-suite.js",
+    "demo": "node src/guided-demo.js",
     "guided-demo": "node src/guided-demo.js"
   },
   "keywords": [

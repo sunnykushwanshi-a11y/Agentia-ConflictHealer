@@ -1,16 +1,18 @@
 /**
- * Salesforce XML Conflict Resolver
- * Understands Salesforce XML metadata structures:
- * - Profiles / PermissionSets (<userPermissions>, <fieldPermissions>, <objectPermissions>)
- * - Package XML (<types><members>...</members><name>...</name></types>)
- * - Custom Objects (<fields>, <validationRules>, <indexes>)
- * - Labels (<labels>)
+ * Salesforce XML Conflict Resolver (Facade & General Dispatcher)
+ * Coordinates specialized resolvers for package.xml and permission sets,
+ * and handles generic XML document-level reconciliation.
  */
 
 import { XMLParser, XMLBuilder, XMLValidator } from 'fast-xml-parser';
+import { PackageXmlResolver } from './package-resolver.js';
+import { PermissionSetResolver } from './permissionset-resolver.js';
 
 export class SalesforceXmlResolver {
   constructor() {
+    this.packageResolver = new PackageXmlResolver();
+    this.permissionSetResolver = new PermissionSetResolver();
+
     this.parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: '@_',
@@ -29,121 +31,112 @@ export class SalesforceXmlResolver {
   }
 
   /**
-   * Semantically resolves conflict chunks in Salesforce XML
+   * Reconciles two complete branch versions of a metadata document
    */
-  resolveConflictChunk(oursChunk, theirsChunk, filePath) {
-    // If one side is empty, take the other side
-    if (!oursChunk.trim()) return theirsChunk;
-    if (!theirsChunk.trim()) return oursChunk;
+  resolveDocument(oursText, theirsText, filePath = '') {
+    const lowerPath = filePath.toLowerCase();
 
-    // Check if both sides contain sibling XML tags (e.g. <members> or <userPermissions>)
-    const wrapOurs = `<root>${oursChunk}</root>`;
-    const wrapTheirs = `<root>${theirsChunk}</root>`;
-
-    const validOurs = XMLValidator.validate(wrapOurs);
-    const validTheirs = XMLValidator.validate(wrapTheirs);
-
-    if (validOurs === true && validTheirs === true) {
-      try {
-        const parsedOurs = this.parser.parse(wrapOurs).root || {};
-        const parsedTheirs = this.parser.parse(wrapTheirs).root || {};
-
-        // Merge arrays / objects without duplicates
-        const merged = this.mergeXmlNodes(parsedOurs, parsedTheirs);
-        const builtXml = this.builder.build({ root: merged });
-
-        // Strip the wrapper root tags to cleanly replace the chunk
-        const innerContent = builtXml
-          .replace(/<root>\s*/, '')
-          .replace(/\s*<\/root>\s*$/, '');
-
-        return innerContent;
-      } catch (err) {
-        // Fallback to additive union heuristic
-        return this.additiveUnion(oursChunk, theirsChunk);
-      }
+    // 1. Specialized package.xml handler
+    if (lowerPath.endsWith('package.xml') || oursText.includes('<Package') || theirsText.includes('<Package')) {
+      return this.packageResolver.mergePackageXml(oursText, theirsText);
     }
 
-    return this.additiveUnion(oursChunk, theirsChunk);
+    // 2. Specialized PermissionSet / Profile handler
+    if (
+      lowerPath.endsWith('.permissionset-meta.xml') ||
+      lowerPath.endsWith('.permissionset') ||
+      lowerPath.endsWith('.profile-meta.xml') ||
+      lowerPath.endsWith('.profile') ||
+      oursText.includes('<PermissionSet') ||
+      theirsText.includes('<PermissionSet') ||
+      oursText.includes('<Profile') ||
+      theirsText.includes('<Profile')
+    ) {
+      return this.permissionSetResolver.mergePermissionSet(oursText, theirsText);
+    }
+
+    // 3. General XML document resolver
+    return this.mergeGeneralXml(oursText, theirsText);
   }
 
-  /**
-   * Merges two parsed XML structures deeply, deduplicating elements by unique identifiers
-   */
-  mergeXmlNodes(ours, theirs) {
-    const result = { ...ours };
+  mergeGeneralXml(oursDocText, theirsDocText) {
+    const valOurs = XMLValidator.validate(oursDocText);
+    const valTheirs = XMLValidator.validate(theirsDocText);
 
+    if (valOurs !== true) {
+      return { success: false, reason: `Ours branch has invalid XML: ${valOurs.err?.msg || 'syntax error'}` };
+    }
+    if (valTheirs !== true) {
+      return { success: false, reason: `Theirs branch has invalid XML: ${valTheirs.err?.msg || 'syntax error'}` };
+    }
+
+    const docOurs = this.parser.parse(oursDocText);
+    const docTheirs = this.parser.parse(theirsDocText);
+
+    const rootOurs = Object.keys(docOurs)[0];
+    const rootTheirs = Object.keys(docTheirs)[0];
+
+    if (rootOurs !== rootTheirs) {
+      return { success: false, reason: `Root XML tags differ: <${rootOurs}> vs <${rootTheirs}>` };
+    }
+
+    try {
+      const mergedContent = this.mergeXmlObjects(docOurs[rootOurs], docTheirs[rootTheirs]);
+      const built = this.builder.build({ [rootOurs]: mergedContent });
+      const formatted = '<?xml version="1.0" encoding="UTF-8"?>\n' + built + '\n';
+
+      const checkVal = XMLValidator.validate(formatted);
+      if (checkVal !== true) {
+        return { success: false, reason: `Rebuilt XML failed syntax check: ${checkVal.err?.msg}` };
+      }
+
+      return {
+        success: true,
+        mergedXml: formatted,
+        stats: { generalMerge: true },
+      };
+    } catch (err) {
+      return { success: false, reason: `General XML merge failed: ${err.message}` };
+    }
+  }
+
+  mergeXmlObjects(ours, theirs) {
+    const result = { ...ours };
     for (const key of Object.keys(theirs)) {
       if (!result[key]) {
         result[key] = theirs[key];
       } else {
-        const valOurs = result[key];
-        const valTheirs = theirs[key];
+        const valO = result[key];
+        const valT = theirs[key];
 
-        if (Array.isArray(valOurs) && Array.isArray(valTheirs)) {
-          result[key] = this.deduplicateXmlArray(valOurs, valTheirs);
-        } else if (Array.isArray(valOurs)) {
-          result[key] = this.deduplicateXmlArray(valOurs, [valTheirs]);
-        } else if (Array.isArray(valTheirs)) {
-          result[key] = this.deduplicateXmlArray([valOurs], valTheirs);
-        } else if (typeof valOurs === 'object' && typeof valTheirs === 'object') {
-          // If elements have unique identifiers (e.g. <name> or <fullName>)
-          const idOurs = valOurs.name || valOurs.fullName || valOurs.field || JSON.stringify(valOurs);
-          const idTheirs = valTheirs.name || valTheirs.fullName || valTheirs.field || JSON.stringify(valTheirs);
-
-          if (idOurs === idTheirs) {
-            // Favor theirs or deeper merge
-            result[key] = { ...valOurs, ...valTheirs };
-          } else {
-            result[key] = [valOurs, valTheirs];
-          }
-        } else {
-          // Primitive duplicate or conflicting value - favor theirs with preservation
-          result[key] = valTheirs;
+        if (Array.isArray(valO) && Array.isArray(valT)) {
+          result[key] = deduplicateArray(valO, valT);
+        } else if (typeof valO === 'object' && typeof valT === 'object') {
+          result[key] = this.mergeXmlObjects(valO, valT);
+        } else if (String(valO).trim() !== String(valT).trim()) {
+          // Scalar collision: throw error to avoid silent arbitrary override
+          throw new Error(`Incompatible conflict on <${key}>: "${valO}" vs "${valT}"`);
         }
       }
     }
-
     return result;
   }
+}
 
-  deduplicateXmlArray(arr1, arr2) {
-    const combined = [...arr1, ...arr2];
-    const seen = new Set();
-    const result = [];
+function deduplicateArray(arr1, arr2) {
+  const combined = [...arr1, ...arr2];
+  const seen = new Set();
+  const out = [];
 
-    for (const item of combined) {
-      let key;
-      if (typeof item === 'object' && item !== null) {
-        key = item.name || item.fullName || item.field || item['#text'] || JSON.stringify(item);
-      } else {
-        key = String(item);
-      }
+  for (const item of combined) {
+    const key = typeof item === 'object' && item !== null
+      ? (item.name || item.fullName || item.field || item['#text'] || JSON.stringify(item))
+      : String(item);
 
-      if (!seen.has(key)) {
-        seen.add(key);
-        result.push(item);
-      }
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(item);
     }
-
-    return result;
   }
-
-  additiveUnion(oursChunk, theirsChunk) {
-    const linesOurs = oursChunk.split('\n');
-    const linesTheirs = theirsChunk.split('\n');
-    const set = new Set();
-    const result = [];
-
-    for (const line of [...linesOurs, ...linesTheirs]) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      if (!set.has(trimmed)) {
-        set.add(trimmed);
-        result.push(line);
-      }
-    }
-
-    return result.join('\n');
-  }
+  return out;
 }
