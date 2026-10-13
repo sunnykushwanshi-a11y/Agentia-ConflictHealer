@@ -1,0 +1,21 @@
+{
+  "name": "agentia-conflicthealer",
+  "version": "1.0.0",
+  "description": "Semantic Salesforce XML & Metadata Merge-Conflict Auto-Resolution Engine for Agentia CLI",
+  "skills": [
+    {
+      "file": "skills/conflicthealer.agent.md",
+      "targets": ["agents", "cursor", "vscode", "claude"]
+    }
+  ],
+  "mcpServers": {
+    "conflicthealer": {
+      "command": "node",
+      "args": ["src/mcp-server.js"],
+      "description": "Agentia ConflictHealer — Semantic XML merge-conflict resolver"
+    }
+  },
+  "hooks": {
+    "post-merge-conflict": "conflicthealer resolve"
+  }
+}
