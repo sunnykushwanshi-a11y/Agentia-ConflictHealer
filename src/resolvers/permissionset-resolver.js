@@ -49,7 +49,7 @@ export class PermissionSetResolver {
     recordTypeVisibilities: 'recordType',
   };
 
-  mergePermissionSet(oursDocText, theirsDocText) {
+  mergePermissionSet(oursDocText, theirsDocText, baseDocText = null) {
     const valOurs = XMLValidator.validate(oursDocText);
     const valTheirs = XMLValidator.validate(theirsDocText);
 
@@ -58,6 +58,14 @@ export class PermissionSetResolver {
     }
     if (valTheirs !== true) {
       return { success: false, reason: `Theirs branch has invalid XML: ${valTheirs.err?.msg || 'syntax error'}` };
+    }
+
+    let docBase = null;
+    if (baseDocText) {
+      const valBase = XMLValidator.validate(baseDocText);
+      if (valBase === true) {
+        docBase = this.parser.parse(baseDocText);
+      }
     }
 
     const docOurs = this.parser.parse(oursDocText);
@@ -123,31 +131,92 @@ export class PermissionSetResolver {
         if (id) itemsByIdTheirs.set(String(id).trim(), item);
       }
 
-      const allIds = Array.from(new Set([...itemsByIdOurs.keys(), ...itemsByIdTheirs.keys()]));
+      const itemsByIdBase = new Map();
+      if (docBase && docBase[rootKeyOurs] && docBase[rootKeyOurs][key]) {
+        for (const item of toList(docBase[rootKeyOurs][key])) {
+          const id = item[idField];
+          if (id) itemsByIdBase.set(String(id).trim(), item);
+        }
+      }
+
+      const allIds = Array.from(new Set([...itemsByIdOurs.keys(), ...itemsByIdTheirs.keys(), ...itemsByIdBase.keys()]));
       const mergedList = [];
 
       for (const id of allIds) {
-        const itemA = itemsByIdOurs.get(id);
-        const itemB = itemsByIdTheirs.get(id);
+        const itemOurs = itemsByIdOurs.get(id);
+        const itemTheirs = itemsByIdTheirs.get(id);
+        const itemBase = itemsByIdBase.get(id);
 
-        if (itemA && !itemB) {
-          mergedList.push(itemA);
-          permissionsPreserved++;
-        } else if (!itemA && itemB) {
-          mergedList.push(itemB);
-          permissionsPreserved++;
+        if (docBase) {
+          // Genuine 3-way reconciliation
+          if (itemBase && !itemOurs && !itemTheirs) {
+            // Deleted in both branches: cleanly removed
+            continue;
+          } else if (itemBase && !itemOurs && itemTheirs) {
+            // Deleted in ours, present in theirs
+            const diffWithBase = findPropertyDifferences(itemTheirs, itemBase);
+            if (diffWithBase.length === 0) {
+              // Theirs did not touch it; Ours intentionally deleted it -> delete
+              continue;
+            } else {
+              // Delete vs Modify collision: MUST ROUTE TO MANUAL REVIEW
+              conflicts.push(`Delete vs Modify conflict in <${key}> for "${id}": deleted in HEAD, modified in incoming branch`);
+              continue;
+            }
+          } else if (itemBase && itemOurs && !itemTheirs) {
+            // Present in ours, deleted in theirs
+            const diffWithBase = findPropertyDifferences(itemOurs, itemBase);
+            if (diffWithBase.length === 0) {
+              // Ours did not touch it; Theirs intentionally deleted it -> delete
+              continue;
+            } else {
+              // Modify vs Delete collision: MUST ROUTE TO MANUAL REVIEW
+              conflicts.push(`Modify vs Delete conflict in <${key}> for "${id}": modified in HEAD, deleted in incoming branch`);
+              continue;
+            }
+          } else if (!itemBase && itemOurs && !itemTheirs) {
+            // Added by ours
+            mergedList.push(itemOurs);
+            permissionsPreserved++;
+          } else if (!itemBase && !itemOurs && itemTheirs) {
+            // Added by theirs
+            mergedList.push(itemTheirs);
+            permissionsPreserved++;
+          } else if (itemOurs && itemTheirs) {
+            // Present in both branches
+            const diffProps = findPropertyDifferences(itemOurs, itemTheirs);
+            if (diffProps.length === 0) {
+              mergedList.push(itemOurs);
+              duplicatesRemoved++;
+              permissionsPreserved++;
+            } else {
+              // Both modified differently
+              conflicts.push(`Incompatible conflict in <${key}> for "${id}": differences in [${diffProps.join(', ')}]`);
+            }
+          }
         } else {
-          // Present in both branches: check for semantic equality
-          const diffProps = findPropertyDifferences(itemA, itemB);
-
-          if (diffProps.length === 0) {
-            // Exactly identical
-            mergedList.push(itemA);
-            duplicatesRemoved++;
+          // 2-way safe heuristic when no base is available
+          if (itemOurs && !itemTheirs) {
+            // Safe additive retention (prevents silent data loss when no base is available)
+            mergedList.push(itemOurs);
+            permissionsPreserved++;
+          } else if (!itemOurs && itemTheirs) {
+            // Safe additive retention
+            mergedList.push(itemTheirs);
             permissionsPreserved++;
           } else {
-            // Disagreement on boolean or field permission value (e.g. enabled=true vs enabled=false)
-            conflicts.push(`Incompatible conflict in <${key}> for "${id}": differences in [${diffProps.join(', ')}]`);
+            // Present in both branches: check for semantic equality
+            const diffProps = findPropertyDifferences(itemOurs, itemTheirs);
+
+            if (diffProps.length === 0) {
+              // Exactly identical
+              mergedList.push(itemOurs);
+              duplicatesRemoved++;
+              permissionsPreserved++;
+            } else {
+              // Disagreement on boolean or field permission value (e.g. enabled=true vs enabled=false)
+              conflicts.push(`Incompatible conflict in <${key}> for "${id}": differences in [${diffProps.join(', ')}]`);
+            }
           }
         }
       }

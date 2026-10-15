@@ -131,7 +131,7 @@ async function main() {
   await sleep(1000);
 
   // 5. Proposed workflow integration
-  console.log(chalk.bold.cyan('  🚀 Release Pipeline Unblocked:'));
+  console.log(chalk.bold.cyan('  🚀 Merge Resolved — Ready for Downstream Validation:'));
   console.log(chalk.gray('     Proposed Copado workflow command (when configured in pipeline):'));
   console.log(chalk.white('     $ agentia cicd work submit --resume\n'));
   await sleep(500);

@@ -33,12 +33,12 @@ export class SalesforceXmlResolver {
   /**
    * Reconciles two complete branch versions of a metadata document
    */
-  resolveDocument(oursText, theirsText, filePath = '') {
+  resolveDocument(oursText, theirsText, filePath = '', baseDocText = null) {
     const lowerPath = filePath.toLowerCase();
 
     // 1. Specialized package.xml handler
     if (lowerPath.endsWith('package.xml') || oursText.includes('<Package') || theirsText.includes('<Package')) {
-      return this.packageResolver.mergePackageXml(oursText, theirsText);
+      return this.packageResolver.mergePackageXml(oursText, theirsText, baseDocText);
     }
 
     // 2. Specialized PermissionSet / Profile handler
@@ -52,7 +52,7 @@ export class SalesforceXmlResolver {
       oursText.includes('<Profile') ||
       theirsText.includes('<Profile')
     ) {
-      return this.permissionSetResolver.mergePermissionSet(oursText, theirsText);
+      return this.permissionSetResolver.mergePermissionSet(oursText, theirsText, baseDocText);
     }
 
     // 3. General XML document resolver

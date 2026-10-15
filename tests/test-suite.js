@@ -395,6 +395,118 @@ async function runAllTests() {
     assert(firstOutput === secondOutput, 'File content must be identical after run 2');
   });
 
+  // ── TEST 13: 3-Way Base: Item deleted by one branch (clean deletion) ─
+  await runTest('13. 3-Way Base: Clean deletion by one branch honored when base provided', async () => {
+    const { PermissionSetResolver } = await import('../src/resolvers/permissionset-resolver.js');
+    const resolver = new PermissionSetResolver();
+
+    const base = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <userPermissions><enabled>true</enabled><name>ExportReport</name></userPermissions>
+    <userPermissions><enabled>true</enabled><name>ViewSetup</name></userPermissions>
+</PermissionSet>`;
+
+    // Branch A intentionally deleted ViewSetup
+    const ours = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <userPermissions><enabled>true</enabled><name>ExportReport</name></userPermissions>
+</PermissionSet>`;
+
+    // Branch B left ViewSetup untouched
+    const theirs = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <userPermissions><enabled>true</enabled><name>ExportReport</name></userPermissions>
+    <userPermissions><enabled>true</enabled><name>ViewSetup</name></userPermissions>
+</PermissionSet>`;
+
+    const result = resolver.mergePermissionSet(ours, theirs, base);
+    assert(result.success === true, 'Should successfully resolve with base awareness');
+    assert(!result.mergedXml.includes('ViewSetup'), 'Clean deletion in branch A must be honored');
+    assert(result.mergedXml.includes('ExportReport'), 'ExportReport must be retained');
+  });
+
+  // ── TEST 14: 3-Way Base: Modify vs Delete collision routed to review ─
+  await runTest('14. 3-Way Base: Modify vs Delete collision routed to review', async () => {
+    const { PermissionSetResolver } = await import('../src/resolvers/permissionset-resolver.js');
+    const resolver = new PermissionSetResolver();
+
+    const base = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <userPermissions><enabled>true</enabled><name>ManageUsers</name></userPermissions>
+</PermissionSet>`;
+
+    // Branch A deleted ManageUsers
+    const ours = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <hasActivationRequired>false</hasActivationRequired>
+</PermissionSet>`;
+
+    // Branch B modified ManageUsers (changed enabled to false)
+    const theirs = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <hasActivationRequired>false</hasActivationRequired>
+    <userPermissions><enabled>false</enabled><name>ManageUsers</name></userPermissions>
+</PermissionSet>`;
+
+    const result = resolver.mergePermissionSet(ours, theirs, base);
+    assert(result.success === false, 'Must NOT auto-resolve Delete vs Modify collision');
+    assert(result.requiresReview === true, 'Must route Delete vs Modify to manual review');
+    assert(result.reason.includes('Delete vs Modify'), 'Reason must diagnose Delete vs Modify collision');
+  });
+
+  // ── TEST 15: 3-Way Base: Both modifying same item differently ────────
+  await runTest('15. 3-Way Base: Both modifying same item differently routed to review', async () => {
+    const { PermissionSetResolver } = await import('../src/resolvers/permissionset-resolver.js');
+    const resolver = new PermissionSetResolver();
+
+    const base = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fieldPermissions><editable>false</editable><field>Account.Rating</field><readable>true</readable></fieldPermissions>
+</PermissionSet>`;
+
+    // Branch A made it editable=true
+    const ours = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fieldPermissions><editable>true</editable><field>Account.Rating</field><readable>true</readable></fieldPermissions>
+</PermissionSet>`;
+
+    // Branch B made readable=false
+    const theirs = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fieldPermissions><editable>false</editable><field>Account.Rating</field><readable>false</readable></fieldPermissions>
+</PermissionSet>`;
+
+    const result = resolver.mergePermissionSet(ours, theirs, base);
+    assert(result.success === false, 'Must NOT resolve divergent field permission modifications');
+    assert(result.requiresReview === true, 'Must route divergent field permission modifications to review');
+  });
+
+  // ── TEST 16: Atomic File Write Safety on Aborted Operations ──────────
+  await runTest('16. Atomic write safety: Unresolved files never modified, no temp artifacts left', async () => {
+    const filePath = join(TEST_DIR, 'permissionsets/Broken.permissionset-meta.xml');
+    await mkdir(join(TEST_DIR, 'permissionsets'), { recursive: true });
+    const originalConflicted = `<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+<<<<<<< HEAD
+    <userPermissions><enabled>true</enabled><name>PermA</name></userPermissions>
+=======
+    <userPermissions><enabled>false</enabled><name>PermA</name></userPermissions>
+>>>>>>> branch-b
+</PermissionSet>`;
+    await writeFile(filePath, originalConflicted, 'utf8');
+
+    const res = await healConflicts(TEST_DIR, { backup: true });
+    assert(res.healedFiles.length === 0, 'Must not report healed');
+    assert(res.manualReviewFiles.length === 1, 'Must flag manual review');
+
+    const currentOnDisk = await readFile(filePath, 'utf8');
+    assert(currentOnDisk === originalConflicted, 'Original conflicted file must be bit-for-bit identical');
+
+    // Confirm no leftover .tmp files
+    const allFiles = await (await import('glob')).glob('**/*', { cwd: TEST_DIR, nodir: true });
+    assert(!allFiles.some(f => f.includes('.tmp')), 'No temporary files must remain on disk');
+  });
+
   // ── FINAL SUMMARY ──────────────────────────────────────────────────
   await rm(TEST_DIR, { recursive: true, force: true });
   console.log(chalk.bold.cyan('\n════════════════════════════════════════════════════════════════════════'));

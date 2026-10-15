@@ -108,14 +108,29 @@ export async function healConflicts(targetPath = '.', options = {}) {
         continue;
       }
 
-      // Writing safely with backup
+      // Writing safely via temporary file with atomic replacement
       const backupPath = `${file}.bak`;
+      const tempPath = `${file}.tmp.${Date.now()}`;
       if (!options.dryRun) {
         if (options.backup !== false) {
           await copyFile(file, backupPath);
           backupsCreated.push(path.relative(absPath, backupPath));
         }
-        await writeFile(file, mergedXml, 'utf8');
+
+        // 1. Write to temporary file first
+        await writeFile(tempPath, mergedXml, 'utf8');
+
+        // 2. Read back from temp and verify before replacing original
+        const tempVerification = await readFile(tempPath, 'utf8');
+        const tempXmlValid = XMLValidator.validate(tempVerification);
+        if (tempXmlValid !== true || hasAnyConflictMarker(tempVerification)) {
+          await unlink(tempPath);
+          throw new Error('Integrity check on temporary file failed before atomic replace.');
+        }
+
+        // 3. Atomic replacement
+        await copyFile(tempPath, file);
+        await unlink(tempPath);
       }
 
       healedFiles.push({
